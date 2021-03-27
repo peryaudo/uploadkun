@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"syscall"
 	"os"
-	"time"
 
 	"github.com/hanwen/go-fuse/fs"
 	"github.com/hanwen/go-fuse/fuse"
@@ -54,8 +53,11 @@ func (dn *dirNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrO
 	return 0
 }
 
+var fileReq chan *fileNode
+
 type fileNode struct {
 	metadata *JsonEntry
+	loc []string
 	fs.Inode
 }
 
@@ -73,22 +75,32 @@ func (fn *fileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Attr
 	return 0
 }
 
-func addEntry(parent *fs.Inode, entry *JsonEntry) {
+func (fn *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	fileReq <- fn
+	return nil, 0, 0
+}
+
+func (fn *fileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	return fuse.ReadResultData(dest), 0
+}
+
+func addEntry(parent *fs.Inode, entry *JsonEntry, loc []string) {
+	loc = append(loc, entry.Name)
 	var child *fs.Inode
 	switch entry.Kind {
 	case File:
-		child = parent.NewPersistentInode(context.Background(), &fileNode{metadata: entry}, fs.StableAttr{})
+		child = parent.NewPersistentInode(context.Background(), &fileNode{metadata: entry, loc: loc}, fs.StableAttr{})
 	case Directory:
 		child = parent.NewPersistentInode(context.Background(), &dirNode{metadata: entry}, fs.StableAttr{Mode: syscall.S_IFDIR})
 		for _, subEntry := range entry.Entries {
-			addEntry(child, &subEntry)
+			addEntry(child, &subEntry, loc)
 		}
 	}
 	parent.AddChild(entry.Name, child, true)
 }
 
 func main() {
-	bootTime = time.Now().Unix()
+	fileReq = make(chan *fileNode)
 	root := &fs.Inode{}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -101,12 +113,24 @@ func main() {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 		root.RmAllChildren()
-		addEntry(root, &rootEntry)
+		addEntry(root, &rootEntry, []string{})
 		response := struct {
-			Success bool
+			Success bool `json:"success"`
 		}{
 			Success: true,
 		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+	http.HandleFunc("/pollFileRequest", func(w http.ResponseWriter, r *http.Request) {
+		fn := <- fileReq
+
+		response := struct {
+			Location []string `json:"location"`
+		}{
+			Location: fn.loc,
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 	})
