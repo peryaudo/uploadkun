@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io/ioutil"
 	"log"
 	"net/http"
-	"syscall"
 	"os"
+	"syscall"
 
 	"github.com/hanwen/go-fuse/fs"
 	"github.com/hanwen/go-fuse/fuse"
@@ -34,11 +35,11 @@ func (k *EntryKind) UnmarshalJSON(b []byte) error {
 }
 
 type JsonEntry struct {
-	Kind    EntryKind   `json:"kind"`
-	Name    string      `json:"name"`
-	Size	uint64 `json:"size"`
-	LastModified uint64 `json:"lastModified"`
-	Entries []JsonEntry `json:"entries"`
+	Kind         EntryKind   `json:"kind"`
+	Name         string      `json:"name"`
+	Size         uint64      `json:"size"`
+	LastModified uint64      `json:"lastModified"`
+	Entries      []JsonEntry `json:"entries"`
 }
 
 type dirNode struct {
@@ -57,8 +58,11 @@ var fileReq chan *fileNode
 
 type fileNode struct {
 	metadata *JsonEntry
-	loc []string
+	loc      []string
 	fs.Inode
+
+	cacheReady chan bool
+	cache      []byte
 }
 
 func (fn *fileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -76,12 +80,24 @@ func (fn *fileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Attr
 }
 
 func (fn *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	fileReq <- fn
+	if fn.cache == nil {
+		fileReq <- fn
+	}
 	return nil, 0, 0
 }
 
 func (fn *fileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	return fuse.ReadResultData(dest), 0
+	if fn.cache == nil {
+		// TODO: Is there a race?
+		fn.cacheReady = make(chan bool)
+		<-fn.cacheReady
+		fn.cacheReady = nil
+	}
+	end := int(off) + len(dest)
+	if end > len(fn.cache) {
+		end = len(fn.cache)
+	}
+	return fuse.ReadResultData(fn.cache[off:end]), 0
 }
 
 func addEntry(parent *fs.Inode, entry *JsonEntry, loc []string) {
@@ -121,9 +137,10 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
+		// TODO: Should return a sequence number so that we don't send wrong pollFileRequest to a wrong client.
 	})
 	http.HandleFunc("/pollFileRequest", func(w http.ResponseWriter, r *http.Request) {
-		fn := <- fileReq
+		fn := <-fileReq
 
 		response := struct {
 			Location []string `json:"location"`
@@ -131,6 +148,54 @@ func main() {
 			Location: fn.loc,
 		}
 
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+	http.HandleFunc("/uploadFile", func(w http.ResponseWriter, r *http.Request) {
+		r.ParseMultipartForm(100 * 1024 * 1024)
+		f, _, err := r.FormFile("f")
+		if err != nil {
+			log.Println("uploadFile: ", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		defer f.Close()
+		b, err := ioutil.ReadAll(f)
+		if err != nil {
+			log.Println("uploadFile: ", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+
+		var loc []string
+		if err := json.Unmarshal([]byte(r.FormValue("loc")), &loc); err != nil {
+			log.Println("uploadFile: ", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+
+		node := root
+		for _, l := range loc {
+			node = node.GetChild(l)
+			if node == nil {
+				log.Println("uploadFile: not found...")
+				http.Error(w, "no matching file found", http.StatusInternalServerError)
+				return
+			}
+		}
+		fn, ok := node.Operations().(*fileNode)
+		if !ok {
+			log.Println("uploadFile: cannot get fileNode")
+			http.Error(w, "cannot get fileNode", http.StatusInternalServerError)
+			return
+		}
+		fn.cache = b
+		if fn.cacheReady != nil {
+			fn.cacheReady <- true
+		}
+
+		response := struct {
+			Success bool `json:"success"`
+		}{
+			Success: true,
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 	})

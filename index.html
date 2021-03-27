@@ -22,7 +22,13 @@
 			async function uploadFile(loc) {
 				const entry = await getHandleForLocation(rootDirHandle, loc.slice(1));
 				const file = await entry.getFile();
-				console.log(entry);
+				const formData = new FormData();
+				formData.append('f', file);
+				formData.append('loc', JSON.stringify(loc));
+				await fetch('/uploadFile', {
+					method: 'PUT',
+					body: formData
+				});
 			}
 			async function getDirList(entry) {
 				const result = {'kind': entry.kind, 'name': entry.name};
