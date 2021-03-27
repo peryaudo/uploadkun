@@ -12,6 +12,10 @@
 					for await (const subEntry of entry.values()) {
 						result['entries'].push(await getDirList(subEntry));
 					}
+				} else if (entry.kind == 'file') {
+					const file = await entry.getFile();
+					result['size'] = file.size;
+					result['lastModified'] = Math.floor(file.lastModified / 1000);
 				}
 				return result;
 			}
