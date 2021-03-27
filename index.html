@@ -1,0 +1,30 @@
+<html>
+	<head>
+		<title>upload-kun</title>
+	</head>
+	<body>
+		<button type="button" id="allow-access">Allow access to the directory...</button>
+		<script>
+			async function getDirList(entry) {
+				const result = {'kind': entry.kind, 'name': entry.name};
+				if (entry.kind == 'directory') {
+					result['entries'] = [];
+					for await (const subEntry of entry.values()) {
+						result['entries'].push(await getDirList(subEntry));
+					}
+				}
+				return result;
+			}
+			document.getElementById("allow-access").addEventListener('click', async () => {
+				const dirHandle = await window.showDirectoryPicker();
+				const dirList = await getDirList(dirHandle);
+				await fetch('/notifyEntries', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(dirList)
+				});
+			});
+		</script>
+	</body>
+</html>
+
