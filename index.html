@@ -50,7 +50,11 @@
 					await pollFileRequest();
 				} else if (response.status === 200) {
 					let respJson = await response.json();
-					uploadFile(respJson['location']);
+					if (respJson['kind'] === 'upload') {
+						uploadFile(respJson['location']);
+					} else if (respJson['kind'] === 'download') {
+						window.location = '/downloadFile';
+					}
 					await pollFileRequest();
 				} else {
 					console.log(response.statusText);

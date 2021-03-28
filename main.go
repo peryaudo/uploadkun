@@ -54,6 +54,27 @@ func (dn *dirNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrO
 	return 0
 }
 
+func (dn *dirNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	log.Println("Create: ", name)
+
+	child := dn.NewPersistentInode(ctx, &memFileNode{name, fs.MemRegularFile{Data: []byte{}, Attr: fuse.Attr{Mode: 0644}}}, fs.StableAttr{})
+	dn.AddChild(name, child, true)
+	return child, nil, 0, 0
+}
+
+var downloadReq chan *memFileNode
+
+type memFileNode struct {
+	name string
+	fs.MemRegularFile
+}
+
+func (mfn *memFileNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
+	log.Println("Flush: ", mfn.Data)
+	downloadReq <- mfn
+	return 0
+}
+
 var fileReq chan *fileNode
 
 type fileNode struct {
@@ -117,7 +138,10 @@ func addEntry(parent *fs.Inode, entry *JsonEntry, loc []string) {
 
 func main() {
 	fileReq = make(chan *fileNode)
+	downloadReq = make(chan *memFileNode)
 	root := &fs.Inode{}
+
+	var downFileNode *memFileNode
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "index.html")
@@ -140,16 +164,37 @@ func main() {
 		// TODO: Should return a sequence number so that we don't send wrong pollFileRequest to a wrong client.
 	})
 	http.HandleFunc("/pollFileRequest", func(w http.ResponseWriter, r *http.Request) {
-		fn := <-fileReq
+		select {
+		case fn := <-fileReq:
+			response := struct {
+				Kind     string   `json:"kind"`
+				Location []string `json:"location"`
+			}{
+				Kind:     "upload",
+				Location: fn.loc,
+			}
 
-		response := struct {
-			Location []string `json:"location"`
-		}{
-			Location: fn.loc,
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
+		case mfn := <-downloadReq:
+			downFileNode = mfn
+			response := struct {
+				Kind string `json:"kind"`
+			}{
+				Kind: "download",
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+	})
+	http.HandleFunc("/downloadFile", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+downFileNode.name+"\"")
+		if _, err := w.Write(downFileNode.Data); err != nil {
+			log.Println("downloadFile: failed to write")
+			return
+		}
 	})
 	http.HandleFunc("/uploadFile", func(w http.ResponseWriter, r *http.Request) {
 		r.ParseMultipartForm(100 * 1024 * 1024)
