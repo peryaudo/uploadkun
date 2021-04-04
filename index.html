@@ -7,6 +7,7 @@
 		<script>
 			var rootDirHandle;
 			var seq;
+			var lastDirList;
 			async function uploadFile(filename) {
 				const entry = await rootDirHandle.getFileHandle(filename);
 				const file = await entry.getFile();
@@ -52,11 +53,16 @@
 			}
 			async function notifyDirList() {
 				const dirList = await getDirList(rootDirHandle);
+				if (JSON.stringify(dirList) === JSON.stringify(lastDirList)) {
+					setTimeout(notifyDirList, 1000);
+					return;
+				}
 				const response = await fetch('/notifyEntries' + (seq ? '?seq=' + seq : ''), {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify(dirList)
 				});
+				lastDirList = dirList;
 				const respJson = await response.json();
 				if (!seq) {
 					seq = respJson.seq;

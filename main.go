@@ -118,6 +118,7 @@ func updateEntries(root *rootNode, entries []JsonEntry) {
 
 	for _, entry := range entries {
 		if child := root.GetChild(entry.Name); child != nil {
+			child.Operations().(*fileNode).metadata = entry
 			continue
 		}
 		child := root.NewPersistentInode(
@@ -245,12 +246,7 @@ func main() {
 			http.Error(w, "no matching file found", http.StatusInternalServerError)
 			return
 		}
-		fn, ok := node.Operations().(*fileNode)
-		if !ok {
-			log.Println("uploadFile: cannot get fileNode")
-			http.Error(w, "cannot get fileNode", http.StatusInternalServerError)
-			return
-		}
+		fn := node.Operations().(*fileNode)
 		fn.cache = b
 		if fn.cacheReady != nil {
 			fn.cacheReady <- true
@@ -265,6 +261,7 @@ func main() {
 		json.NewEncoder(w).Encode(response)
 	})
 	go func() {
+		log.Println("Listening on port " + httpPort + "...")
 		log.Fatal(http.ListenAndServe("127.0.0.1:"+httpPort, nil))
 	}()
 
