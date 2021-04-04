@@ -62,10 +62,9 @@
 				}
 
 			}
-			document.getElementById("allow-access").addEventListener('click', async () => {
-				rootDirHandle = await window.showDirectoryPicker();
+			async function notifyDirList() {
 				const dirList = await getDirList(rootDirHandle);
-				const response = await fetch('/notifyEntries', {
+				const response = await fetch('/notifyEntries' + (seq ? '?seq=' + seq : ''), {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify(dirList)
@@ -73,7 +72,18 @@
 				const respJson = await response.json();
 				if (!seq) {
 					seq = respJson.seq;
+					if (!seq) {
+						console.log('the server did not provider the sequence number');
+						return;
+					}
 					pollFileRequest();
+				}
+				setTimeout(notifyDirList, 1000);
+			}
+			document.getElementById("allow-access").addEventListener('click', async () => {
+				rootDirHandle = await window.showDirectoryPicker();
+				if (!seq) {
+					notifyDirList();
 				}
 			});
 		</script>
