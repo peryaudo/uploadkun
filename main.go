@@ -118,7 +118,10 @@ func updateEntries(root *rootNode, entries []JsonEntry) {
 
 	for _, entry := range entries {
 		if child := root.GetChild(entry.Name); child != nil {
-			child.Operations().(*fileNode).metadata = entry
+			if fn, ok := child.Operations().(*fileNode); ok {
+				fn.metadata = entry
+			}
+			// TODO(tetsui): Handle when it's a file that has been just downloaded
 			continue
 		}
 		child := root.NewPersistentInode(
@@ -187,7 +190,9 @@ func main() {
 		}
 		select {
 		case fn := <-fileReq:
-			// TODO(tetsui): check the sequence number here
+			if !checkSequenceNumber(seq, w, r) {
+				return
+			}
 			response := struct {
 				Kind     string `json:"kind"`
 				Filename string `json:"filename"`
@@ -199,7 +204,9 @@ func main() {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(response)
 		case mfn := <-downloadReq:
-			// TODO(tetsui): ditto
+			if !checkSequenceNumber(seq, w, r) {
+				return
+			}
 			downFileNode = mfn
 			response := struct {
 				Kind string `json:"kind"`
