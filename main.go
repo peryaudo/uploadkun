@@ -29,6 +29,7 @@ type localFileNode struct {
 	fs.Inode
 
 	file *os.File
+	isSent bool
 }
 
 func NewLocalFileNode(name string) (*localFileNode, error) {
@@ -36,7 +37,7 @@ func NewLocalFileNode(name string) (*localFileNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &localFileNode{name: name, file: tmpfile}, nil
+	return &localFileNode{name: name, file: tmpfile, isSent: false}, nil
 }
 
 func (fn *localFileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -58,15 +59,18 @@ func (fn *localFileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte,
 }
 
 func (fn *localFileNode) Write(ctx context.Context, f fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
-	n, err := syscall.Pwrite(int(fn.file.Fd()), data, off)
-	if err != nil {
-		log.Println("syscall.Pwrite failing fd = ", fn.file.Fd(), err)
+	if fn.isSent {
+		return 0, syscall.EPERM
 	}
+	n, err := syscall.Pwrite(int(fn.file.Fd()), data, off)
 	return uint32(n), fs.ToErrno(err)
 }
 
 func (fn *localFileNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
-	log.Println("Flush")
+	if fn.isSent {
+		return 0
+	}
+	fn.isSent = true
 	downloadReq <- fn
 	return 0
 }
@@ -97,8 +101,6 @@ func (rn *rootNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Attr
 }
 
 func (rn *rootNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	log.Println("Create: ", name)
-
 	node, err := NewLocalFileNode(name)
 	if err != nil {
 		log.Println("Failed to create a local file node: ", err)
@@ -109,6 +111,8 @@ func (rn *rootNode) Create(ctx context.Context, name string, flags uint32, mode 
 	rn.AddChild(name, child, true)
 	return child, nil, 0, 0
 }
+
+// TODO(tetsui): Return permission error for rmdir, mkdir, symlink, rm
 
 var fileReq chan *remoteFileNode
 
@@ -187,15 +191,6 @@ func updateEntries(root *rootNode, entries []JsonEntry) {
 			if fn, ok := child.Operations().(*remoteFileNode); ok {
 				fn.metadata = entry
 				continue
-			}
-
-			// TODO(tetsui): This mechanism seems not working. debug?
-			if fn, ok := child.Operations().(*localFileNode); ok {
-				cacheFile = fn.file
-				// so that it's not closed by Release()
-				fn.file = nil
-				root.NotifyDelete(entry.Name, child)
-				root.RmChild(entry.Name)
 			}
 		}
 		child := root.NewPersistentInode(
