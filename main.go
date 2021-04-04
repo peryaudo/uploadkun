@@ -22,17 +22,66 @@ type JsonEntry struct {
 	LastModified uint64 `json:"lastModified"`
 }
 
-var downloadReq chan *memFileNode
+var downloadReq chan *localFileNode
 
-// TODO(tetsui): Use loopback instead of mem file
-type memFileNode struct {
+type localFileNode struct {
 	name string
-	fs.MemRegularFile
+	fs.Inode
+
+	file *os.File
 }
 
-func (mfn *memFileNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
+func NewLocalFileNode(name string) (*localFileNode, error) {
+	tmpfile, err := ioutil.TempFile("", "localFile")
+	if err != nil {
+		return nil, err
+	}
+	return &localFileNode{name: name, file: tmpfile}, nil
+}
+
+func (fn *localFileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	st := syscall.Stat_t{}
+	err := syscall.Fstat(int(fn.file.Fd()), &st)
+	if err != nil {
+		return fs.ToErrno(err)
+	}
+	out.FromStat(&st)
+	return 0
+}
+
+func (fn *localFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	return nil, 0, 0
+}
+
+func (fn *localFileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	return fuse.ReadResultFd(fn.file.Fd(), off, len(dest)), 0
+}
+
+func (fn *localFileNode) Write(ctx context.Context, f fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	n, err := syscall.Pwrite(int(fn.file.Fd()), data, off)
+	if err != nil {
+		log.Println("syscall.Pwrite failing fd = ", fn.file.Fd(), err)
+	}
+	return uint32(n), fs.ToErrno(err)
+}
+
+func (fn *localFileNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
 	log.Println("Flush")
-	downloadReq <- mfn
+	downloadReq <- fn
+	return 0
+}
+
+func (fn *localFileNode) Release(ctx context.Context) syscall.Errno {
+	if fn.file != nil {
+		if err := fn.file.Close(); err != nil {
+			log.Println("Release: ", err)
+			return syscall.EIO
+		}
+		if err := os.Remove(fn.file.Name()); err != nil {
+			log.Println("Release: ", err)
+			return syscall.EIO
+		}
+	}
 	return 0
 }
 
@@ -50,7 +99,13 @@ func (rn *rootNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Attr
 func (rn *rootNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	log.Println("Create: ", name)
 
-	child := rn.NewPersistentInode(ctx, &memFileNode{name, fs.MemRegularFile{Data: []byte{}, Attr: fuse.Attr{Mode: 0644}}}, fs.StableAttr{})
+	node, err := NewLocalFileNode(name)
+	if err != nil {
+		log.Println("Failed to create a local file node: ", err)
+		return nil, nil, 0, syscall.EIO
+	}
+
+	child := rn.NewPersistentInode(ctx, node, fs.StableAttr{})
 	rn.AddChild(name, child, true)
 	return child, nil, 0, 0
 }
@@ -127,15 +182,24 @@ func updateEntries(root *rootNode, entries []JsonEntry) {
 	}
 
 	for _, entry := range entries {
+		var cacheFile *os.File
 		if child := root.GetChild(entry.Name); child != nil {
 			if fn, ok := child.Operations().(*remoteFileNode); ok {
 				fn.metadata = entry
+				continue
 			}
-			// TODO(tetsui): Handle when it's a file that has been just downloaded
-			continue
+
+			// TODO(tetsui): This mechanism seems not working. debug?
+			if fn, ok := child.Operations().(*localFileNode); ok {
+				cacheFile = fn.file
+				// so that it's not closed by Release()
+				fn.file = nil
+				root.NotifyDelete(entry.Name, child)
+				root.RmChild(entry.Name)
+			}
 		}
 		child := root.NewPersistentInode(
-			context.Background(), &remoteFileNode{metadata: entry}, fs.StableAttr{})
+			context.Background(), &remoteFileNode{metadata: entry, cacheFile: cacheFile}, fs.StableAttr{})
 		root.AddChild(entry.Name, child, true)
 		root.NotifyEntry(entry.Name)
 	}
@@ -162,10 +226,10 @@ func main() {
 	httpPort := os.Args[2]
 
 	fileReq = make(chan *remoteFileNode)
-	downloadReq = make(chan *memFileNode)
+	downloadReq = make(chan *localFileNode)
 	root := &rootNode{}
 
-	var downFileNode *memFileNode
+	var downFileNode *localFileNode
 
 	seq := 0
 
@@ -200,6 +264,7 @@ func main() {
 		}
 		select {
 		case fn := <-fileReq:
+			// TODO(tetsui): Resend the request to the correct client.
 			if !checkSequenceNumber(seq, w, r) {
 				return
 			}
@@ -213,11 +278,11 @@ func main() {
 
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(response)
-		case mfn := <-downloadReq:
+		case fn := <-downloadReq:
 			if !checkSequenceNumber(seq, w, r) {
 				return
 			}
-			downFileNode = mfn
+			downFileNode = fn
 			response := struct {
 				Kind string `json:"kind"`
 			}{
@@ -234,7 +299,13 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+downFileNode.name+"\"")
-		if _, err := w.Write(downFileNode.Data); err != nil {
+		f := downFileNode.file
+		if _, err := f.Seek(0, 0); err != nil {
+			log.Println("downloadFile: ", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := io.Copy(w, f); err != nil {
 			log.Println("downloadFile: failed to write")
 			return
 		}
