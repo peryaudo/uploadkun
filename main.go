@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"syscall"
 
@@ -140,6 +141,12 @@ func checkSequenceNumber(seq int, w http.ResponseWriter, r *http.Request) bool {
 }
 
 func main() {
+	if len(os.Args) < 3 {
+		log.Fatalln("usage: uploadkun mount_point http_port")
+	}
+	mntDir := os.Args[1]
+	httpPort := os.Args[2]
+
 	fileReq = make(chan *fileNode)
 	downloadReq = make(chan *memFileNode)
 	root := &rootNode{}
@@ -258,15 +265,17 @@ func main() {
 		json.NewEncoder(w).Encode(response)
 	})
 	go func() {
-		log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
+		log.Fatal(http.ListenAndServe("127.0.0.1:"+httpPort, nil))
 	}()
-
-	mntDir := "/tmp/x"
 
 	server, err := fs.Mount(mntDir, root, &fs.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("unmount by fusermount -u %s\n", mntDir)
+	if runtime.GOOS == "darwin" {
+		log.Printf("unmount by mount %s\n", mntDir)
+	} else if runtime.GOOS == "linux" {
+		log.Printf("unmount by fusermount -u %s\n", mntDir)
+	}
 	server.Wait()
 }
