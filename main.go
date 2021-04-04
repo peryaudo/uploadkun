@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -62,7 +63,7 @@ type fileNode struct {
 	fs.Inode
 
 	cacheReady chan bool
-	cache      []byte
+	cacheFile  *os.File
 }
 
 func (fn *fileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -80,24 +81,34 @@ func (fn *fileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Attr
 }
 
 func (fn *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	if fn.cache == nil {
+	if fn.cacheFile == nil {
 		fileReq <- fn
 	}
 	return nil, 0, 0
 }
 
 func (fn *fileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	if fn.cache == nil {
+	if fn.cacheFile == nil {
 		// TODO: Is there a race?
 		fn.cacheReady = make(chan bool)
 		<-fn.cacheReady
 		fn.cacheReady = nil
 	}
-	end := int(off) + len(dest)
-	if end > len(fn.cache) {
-		end = len(fn.cache)
+	return fuse.ReadResultFd(fn.cacheFile.Fd(), off, len(dest)), 0
+}
+
+func (fn *fileNode) Release(ctx context.Context) syscall.Errno {
+	if fn.cacheFile != nil {
+		if err := fn.cacheFile.Close(); err != nil {
+			log.Println("Release: ", err)
+			return syscall.EIO
+		}
+		if err := os.Remove(fn.cacheFile.Name()); err != nil {
+			log.Println("Release: ", err)
+			return syscall.EIO
+		}
 	}
-	return fuse.ReadResultData(fn.cache[off:end]), 0
+	return 0
 }
 
 func updateEntries(root *rootNode, entries []JsonEntry) {
@@ -238,10 +249,16 @@ func main() {
 		if err != nil {
 			log.Println("uploadFile: ", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		defer f.Close()
-		b, err := ioutil.ReadAll(f)
+		tmpfile, err := ioutil.TempFile("", "uploadedFile")
 		if err != nil {
+			log.Println("uploadFile: ", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := io.Copy(tmpfile, f); err != nil {
 			log.Println("uploadFile: ", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
@@ -254,7 +271,7 @@ func main() {
 			return
 		}
 		fn := node.Operations().(*fileNode)
-		fn.cache = b
+		fn.cacheFile = tmpfile
 		if fn.cacheReady != nil {
 			fn.cacheReady <- true
 		}
