@@ -7,41 +7,30 @@
 		<script>
 			var rootDirHandle;
 			var seq;
-			async function getHandleForLocation(entry, loc) {
-				for (let i = 0; i < loc.length; i++) {
-					if (i === loc.length - 1) {
-						entry = await entry.getFileHandle(loc[i]);
-					} else {
-						entry = await entry.getDirectoryHandle(loc[i]);
-					}
-					if (!entry) {
-						return null;
-					}
-				}
-				return entry;
-			}
-			async function uploadFile(loc) {
-				const entry = await getHandleForLocation(rootDirHandle, loc.slice(1));
+			async function uploadFile(filename) {
+				const entry = await rootDirHandle.getFileHandle(filename);
 				const file = await entry.getFile();
 				const formData = new FormData();
 				formData.append('f', file);
-				formData.append('loc', JSON.stringify(loc));
+				formData.append('filename', filename);
 				await fetch('/uploadFile?seq=' + seq, {
 					method: 'PUT',
 					body: formData
 				});
 			}
-			async function getDirList(entry) {
-				const result = {'kind': entry.kind, 'name': entry.name};
-				if (entry.kind == 'directory') {
-					result['entries'] = [];
-					for await (const subEntry of entry.values()) {
-						result['entries'].push(await getDirList(subEntry));
+			async function getDirList(dirHandle) {
+				const result = [];
+				for await (const entry of dirHandle.values()) {
+					if (entry.kind !== 'file') {
+						continue;
 					}
-				} else if (entry.kind == 'file') {
 					const file = await entry.getFile();
-					result['size'] = file.size;
-					result['lastModified'] = Math.floor(file.lastModified / 1000);
+					result.push({
+						'kind': entry.kind,
+						'name': entry.name,
+						'size': file.size,
+						'lastModified': Math.floor(file.lastModified / 1000),
+					});
 				}
 				return result;
 			}
@@ -52,7 +41,7 @@
 				} else if (response.status === 200) {
 					let respJson = await response.json();
 					if (respJson['kind'] === 'upload') {
-						uploadFile(respJson['location']);
+						uploadFile(respJson['filename']);
 					} else if (respJson['kind'] === 'download') {
 						window.location = '/downloadFile?seq=' + seq;
 					}
@@ -60,7 +49,6 @@
 				} else {
 					console.log(response.statusText);
 				}
-
 			}
 			async function notifyDirList() {
 				const dirList = await getDirList(rootDirHandle);

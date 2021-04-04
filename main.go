@@ -7,80 +7,57 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"syscall"
 	"strconv"
+	"syscall"
 
 	"github.com/hanwen/go-fuse/fs"
 	"github.com/hanwen/go-fuse/fuse"
 )
 
-type EntryKind int
-
-const (
-	File EntryKind = iota
-	Directory
-)
-
-func (k *EntryKind) UnmarshalJSON(b []byte) error {
-	var s string
-	if err := json.Unmarshal(b, &s); err != nil {
-		return err
-	}
-	switch s {
-	case "file":
-		*k = File
-	case "directory":
-		*k = Directory
-	}
-	return nil
-}
-
 type JsonEntry struct {
-	Kind         EntryKind   `json:"kind"`
-	Name         string      `json:"name"`
-	Size         uint64      `json:"size"`
-	LastModified uint64      `json:"lastModified"`
-	Entries      []JsonEntry `json:"entries"`
-}
-
-type dirNode struct {
-	metadata *JsonEntry
-	fs.Inode
-}
-
-func (dn *dirNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	out.Mode = 0755
-	out.Uid = uint32(os.Getuid())
-	out.Gid = uint32(os.Getgid())
-	return 0
-}
-
-func (dn *dirNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	log.Println("Create: ", name)
-
-	child := dn.NewPersistentInode(ctx, &memFileNode{name, fs.MemRegularFile{Data: []byte{}, Attr: fuse.Attr{Mode: 0644}}}, fs.StableAttr{})
-	dn.AddChild(name, child, true)
-	return child, nil, 0, 0
+	Name         string `json:"name"`
+	Size         uint64 `json:"size"`
+	LastModified uint64 `json:"lastModified"`
 }
 
 var downloadReq chan *memFileNode
 
+// TODO(tetsui): Use loopback instead of mem file
 type memFileNode struct {
 	name string
 	fs.MemRegularFile
 }
 
 func (mfn *memFileNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
-	log.Println("Flush: ", mfn.Data)
+	// TODO(tetsui): Use timeout
+	log.Println("Flush")
 	downloadReq <- mfn
 	return 0
+}
+
+type rootNode struct {
+	fs.Inode
+}
+
+func (rn *rootNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.Mode = 0755
+	out.Uid = uint32(os.Getuid())
+	out.Gid = uint32(os.Getgid())
+	return 0
+}
+
+func (rn *rootNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	log.Println("Create: ", name)
+
+	child := rn.NewPersistentInode(ctx, &memFileNode{name, fs.MemRegularFile{Data: []byte{}, Attr: fuse.Attr{Mode: 0644}}}, fs.StableAttr{})
+	rn.AddChild(name, child, true)
+	return child, nil, 0, 0
 }
 
 var fileReq chan *fileNode
 
 type fileNode struct {
-	metadata *JsonEntry
-	loc      []string
+	metadata JsonEntry
 	fs.Inode
 
 	cacheReady chan bool
@@ -122,19 +99,31 @@ func (fn *fileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off 
 	return fuse.ReadResultData(fn.cache[off:end]), 0
 }
 
-func addEntry(parent *fs.Inode, entry *JsonEntry, loc []string) {
-	loc = append(loc, entry.Name)
-	var child *fs.Inode
-	switch entry.Kind {
-	case File:
-		child = parent.NewPersistentInode(context.Background(), &fileNode{metadata: entry, loc: loc}, fs.StableAttr{})
-	case Directory:
-		child = parent.NewPersistentInode(context.Background(), &dirNode{metadata: entry}, fs.StableAttr{Mode: syscall.S_IFDIR})
-		for _, subEntry := range entry.Entries {
-			addEntry(child, &subEntry, loc)
+func updateEntries(root *rootNode, entries []JsonEntry) {
+	entriesMap := make(map[string]bool)
+	for _, entry := range entries {
+		entriesMap[entry.Name] = true
+	}
+	removedMap := make(map[string]*fs.Inode)
+	for name, child := range root.Children() {
+		if !entriesMap[name] {
+			removedMap[name] = child
 		}
 	}
-	parent.AddChild(entry.Name, child, true)
+	for name, child := range removedMap {
+		root.NotifyDelete(name, child)
+		root.RmChild(name)
+	}
+
+	for _, entry := range entries {
+		if child := root.GetChild(entry.Name); child != nil {
+			continue
+		}
+		child := root.NewPersistentInode(
+			context.Background(), &fileNode{metadata: entry}, fs.StableAttr{})
+		root.AddChild(entry.Name, child, true)
+		root.NotifyEntry(entry.Name)
+	}
 }
 
 func checkSequenceNumber(seq int, w http.ResponseWriter, r *http.Request) bool {
@@ -153,7 +142,7 @@ func checkSequenceNumber(seq int, w http.ResponseWriter, r *http.Request) bool {
 func main() {
 	fileReq = make(chan *fileNode)
 	downloadReq = make(chan *memFileNode)
-	root := &fs.Inode{}
+	root := &rootNode{}
 
 	var downFileNode *memFileNode
 
@@ -168,19 +157,18 @@ func main() {
 		} else if !checkSequenceNumber(seq, w, r) {
 			return
 		}
-		var rootEntry JsonEntry
-		if err := json.NewDecoder(r.Body).Decode(&rootEntry); err != nil {
+		var entries []JsonEntry
+		if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
 			log.Println("notifyEntries: ", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
-		root.RmAllChildren()
-		addEntry(root, &rootEntry, []string{})
+		updateEntries(root, entries)
 		response := struct {
 			Success bool `json:"success"`
-			Seq int `json:"seq"`
+			Seq     int  `json:"seq"`
 		}{
 			Success: true,
-			Seq: seq,
+			Seq:     seq,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
@@ -193,11 +181,11 @@ func main() {
 		case fn := <-fileReq:
 			// TODO(tetsui): check the sequence number here
 			response := struct {
-				Kind     string   `json:"kind"`
-				Location []string `json:"location"`
+				Kind     string `json:"kind"`
+				Filename string `json:"filename"`
 			}{
 				Kind:     "upload",
-				Location: fn.loc,
+				Filename: fn.metadata.Name,
 			}
 
 			w.Header().Set("Content-Type", "application/json")
@@ -243,20 +231,12 @@ func main() {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 
-		var loc []string
-		if err := json.Unmarshal([]byte(r.FormValue("loc")), &loc); err != nil {
-			log.Println("uploadFile: ", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-
-		node := root
-		for _, l := range loc {
-			node = node.GetChild(l)
-			if node == nil {
-				log.Println("uploadFile: not found...")
-				http.Error(w, "no matching file found", http.StatusInternalServerError)
-				return
-			}
+		filename := r.FormValue("filename")
+		node := root.GetChild(filename)
+		if node == nil {
+			log.Printf("uploadFile: file %q not found\n", filename)
+			http.Error(w, "no matching file found", http.StatusInternalServerError)
+			return
 		}
 		fn, ok := node.Operations().(*fileNode)
 		if !ok {
