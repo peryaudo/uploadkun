@@ -31,7 +31,6 @@ type memFileNode struct {
 }
 
 func (mfn *memFileNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
-	// TODO(tetsui): Use timeout
 	log.Println("Flush")
 	downloadReq <- mfn
 	return 0
@@ -56,9 +55,9 @@ func (rn *rootNode) Create(ctx context.Context, name string, flags uint32, mode 
 	return child, nil, 0, 0
 }
 
-var fileReq chan *fileNode
+var fileReq chan *remoteFileNode
 
-type fileNode struct {
+type remoteFileNode struct {
 	metadata JsonEntry
 	fs.Inode
 
@@ -66,7 +65,7 @@ type fileNode struct {
 	cacheFile  *os.File
 }
 
-func (fn *fileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+func (fn *remoteFileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = 0644
 	out.Uid = uint32(os.Getuid())
 	out.Gid = uint32(os.Getgid())
@@ -80,14 +79,14 @@ func (fn *fileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Attr
 	return 0
 }
 
-func (fn *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+func (fn *remoteFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if fn.cacheFile == nil {
 		fileReq <- fn
 	}
 	return nil, 0, 0
 }
 
-func (fn *fileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+func (fn *remoteFileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	if fn.cacheFile == nil {
 		// TODO: Is there a race?
 		fn.cacheReady = make(chan bool)
@@ -97,7 +96,7 @@ func (fn *fileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off 
 	return fuse.ReadResultFd(fn.cacheFile.Fd(), off, len(dest)), 0
 }
 
-func (fn *fileNode) Release(ctx context.Context) syscall.Errno {
+func (fn *remoteFileNode) Release(ctx context.Context) syscall.Errno {
 	if fn.cacheFile != nil {
 		if err := fn.cacheFile.Close(); err != nil {
 			log.Println("Release: ", err)
@@ -129,14 +128,14 @@ func updateEntries(root *rootNode, entries []JsonEntry) {
 
 	for _, entry := range entries {
 		if child := root.GetChild(entry.Name); child != nil {
-			if fn, ok := child.Operations().(*fileNode); ok {
+			if fn, ok := child.Operations().(*remoteFileNode); ok {
 				fn.metadata = entry
 			}
 			// TODO(tetsui): Handle when it's a file that has been just downloaded
 			continue
 		}
 		child := root.NewPersistentInode(
-			context.Background(), &fileNode{metadata: entry}, fs.StableAttr{})
+			context.Background(), &remoteFileNode{metadata: entry}, fs.StableAttr{})
 		root.AddChild(entry.Name, child, true)
 		root.NotifyEntry(entry.Name)
 	}
@@ -162,7 +161,7 @@ func main() {
 	mntDir := os.Args[1]
 	httpPort := os.Args[2]
 
-	fileReq = make(chan *fileNode)
+	fileReq = make(chan *remoteFileNode)
 	downloadReq = make(chan *memFileNode)
 	root := &rootNode{}
 
@@ -270,7 +269,7 @@ func main() {
 			http.Error(w, "no matching file found", http.StatusInternalServerError)
 			return
 		}
-		fn := node.Operations().(*fileNode)
+		fn := node.Operations().(*remoteFileNode)
 		fn.cacheFile = tmpfile
 		if fn.cacheReady != nil {
 			fn.cacheReady <- true
