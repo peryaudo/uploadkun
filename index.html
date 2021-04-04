@@ -6,6 +6,7 @@
 		<button type="button" id="allow-access">Allow access to the directory...</button>
 		<script>
 			var rootDirHandle;
+			var seq;
 			async function getHandleForLocation(entry, loc) {
 				for (let i = 0; i < loc.length; i++) {
 					if (i === loc.length - 1) {
@@ -25,7 +26,7 @@
 				const formData = new FormData();
 				formData.append('f', file);
 				formData.append('loc', JSON.stringify(loc));
-				await fetch('/uploadFile', {
+				await fetch('/uploadFile?seq=' + seq, {
 					method: 'PUT',
 					body: formData
 				});
@@ -45,7 +46,7 @@
 				return result;
 			}
 			async function pollFileRequest() {
-				let response = await fetch('/pollFileRequest');
+				let response = await fetch('/pollFileRequest?seq=' + seq);
 				if (response.status === 502) {
 					await pollFileRequest();
 				} else if (response.status === 200) {
@@ -53,7 +54,7 @@
 					if (respJson['kind'] === 'upload') {
 						uploadFile(respJson['location']);
 					} else if (respJson['kind'] === 'download') {
-						window.location = '/downloadFile';
+						window.location = '/downloadFile?seq=' + seq;
 					}
 					await pollFileRequest();
 				} else {
@@ -64,13 +65,17 @@
 			document.getElementById("allow-access").addEventListener('click', async () => {
 				rootDirHandle = await window.showDirectoryPicker();
 				const dirList = await getDirList(rootDirHandle);
-				await fetch('/notifyEntries', {
+				const response = await fetch('/notifyEntries', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify(dirList)
 				});
+				const respJson = await response.json();
+				if (!seq) {
+					seq = respJson.seq;
+					pollFileRequest();
+				}
 			});
-			pollFileRequest();
 		</script>
 	</body>
 </html>

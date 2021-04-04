@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"syscall"
+	"strconv"
 
 	"github.com/hanwen/go-fuse/fs"
 	"github.com/hanwen/go-fuse/fuse"
@@ -136,6 +137,19 @@ func addEntry(parent *fs.Inode, entry *JsonEntry, loc []string) {
 	parent.AddChild(entry.Name, child, true)
 }
 
+func checkSequenceNumber(seq int, w http.ResponseWriter, r *http.Request) bool {
+	if expectedSeq, err := strconv.Atoi(r.URL.Query().Get("seq")); err != nil {
+		log.Println("malformed sequence number")
+		http.Error(w, "malformed sequence number", http.StatusBadRequest)
+		return false
+	} else if expectedSeq != seq {
+		log.Println("sequence number does not match")
+		http.Error(w, "sequence number does not match", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 func main() {
 	fileReq = make(chan *fileNode)
 	downloadReq = make(chan *memFileNode)
@@ -143,10 +157,17 @@ func main() {
 
 	var downFileNode *memFileNode
 
+	seq := 0
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "index.html")
 	})
 	http.HandleFunc("/notifyEntries", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("seq") == "" {
+			seq++
+		} else if !checkSequenceNumber(seq, w, r) {
+			return
+		}
 		var rootEntry JsonEntry
 		if err := json.NewDecoder(r.Body).Decode(&rootEntry); err != nil {
 			log.Println("notifyEntries: ", err)
@@ -156,16 +177,21 @@ func main() {
 		addEntry(root, &rootEntry, []string{})
 		response := struct {
 			Success bool `json:"success"`
+			Seq int `json:"seq"`
 		}{
 			Success: true,
+			Seq: seq,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
-		// TODO: Should return a sequence number so that we don't send wrong pollFileRequest to a wrong client.
 	})
 	http.HandleFunc("/pollFileRequest", func(w http.ResponseWriter, r *http.Request) {
+		if !checkSequenceNumber(seq, w, r) {
+			return
+		}
 		select {
 		case fn := <-fileReq:
+			// TODO(tetsui): check the sequence number here
 			response := struct {
 				Kind     string   `json:"kind"`
 				Location []string `json:"location"`
@@ -177,6 +203,7 @@ func main() {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(response)
 		case mfn := <-downloadReq:
+			// TODO(tetsui): ditto
 			downFileNode = mfn
 			response := struct {
 				Kind string `json:"kind"`
@@ -189,6 +216,9 @@ func main() {
 		}
 	})
 	http.HandleFunc("/downloadFile", func(w http.ResponseWriter, r *http.Request) {
+		if !checkSequenceNumber(seq, w, r) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+downFileNode.name+"\"")
 		if _, err := w.Write(downFileNode.Data); err != nil {
@@ -197,6 +227,9 @@ func main() {
 		}
 	})
 	http.HandleFunc("/uploadFile", func(w http.ResponseWriter, r *http.Request) {
+		if !checkSequenceNumber(seq, w, r) {
+			return
+		}
 		r.ParseMultipartForm(100 * 1024 * 1024)
 		f, _, err := r.FormFile("f")
 		if err != nil {
