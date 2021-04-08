@@ -124,20 +124,6 @@ type remoteFileNode struct {
 	cacheFile  *os.File
 }
 
-func (fn *remoteFileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	out.Mode = 0644
-	out.Uid = uint32(os.Getuid())
-	out.Gid = uint32(os.Getgid())
-	out.Atime = fn.metadata.LastModified
-	out.Mtime = fn.metadata.LastModified
-	out.Ctime = fn.metadata.LastModified
-	out.Size = fn.metadata.Size
-	const bs = 512
-	// out.Blksize = bs
-	out.Blocks = (out.Size + bs - 1) / bs
-	return 0
-}
-
 func (fn *remoteFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if fn.cacheFile == nil {
 		fileReq <- fn
